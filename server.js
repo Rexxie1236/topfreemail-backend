@@ -1,29 +1,24 @@
-const express = require("express");
+const express = require('express');
+const multer = require('multer');
+
 const app = express();
 
-// Parse incoming CloudMailin email (multipart/form-data)
-app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Main webhook endpoint
-app.post("/webhook", async (req, res) => {
-  console.log("📩 Incoming Email from CloudMailin");
+const upload = multer();
 
-  // Log raw body to Railway logs
-  console.log(req.body);
-
-  // Always respond 200 so CloudMailin knows we received it
-  res.status(200).send("Received");
+app.get('/', (req, res) => {
+  res.send('OK');
 });
 
-// Health check
-app.get("/", (req, res) => {
-  res.send("TopFreeMail backend is running");
+app.post('/webhook', upload.any(), (req, res) => {
+  console.log('--- Incoming webhook ---');
+  console.log('Fields:', req.body);
+  console.log('Files:', req.files);
+
+  res.status(200).send({ status: 'ok' });
 });
 
-// Railway gives PORT env var
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
