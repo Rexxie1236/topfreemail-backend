@@ -2,8 +2,8 @@
  * TopFreeMail backend - server.js
  *
  * Receives CloudMailin POSTs at /webhook, saves them to Postgres (Supabase),
- * and auto-creates inbox records when needed.
- * Adds token-protected read endpoints, rate limit and basic security headers.
+ * auto-creates inbox records, provides token/password auth,
+ * and supports token rotation/invalidation.
  */
 
 const express = require("express");
@@ -13,8 +13,21 @@ const crypto = require("crypto");
 const dns = require("dns");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
-const bcrypt = require("bcrypt");
 
+// bcrypt loader: prefer bcryptjs (no native build), fallback to bcrypt
+let bcrypt;
+try {
+  bcrypt = require("bcryptjs");
+  console.log("Using bcryptjs (preferred for zero-build).");
+} catch (e) {
+  try {
+    bcrypt = require("bcrypt");
+    console.log("Using native bcrypt fallback.");
+  } catch (err) {
+    console.error("Please install 'bcryptjs' or 'bcrypt' in your project.");
+    throw err;
+  }
+}
 const SALT_ROUNDS = 10;
 
 // Prefer IPv4 to avoid IPv6 routing issues
@@ -23,39 +36,26 @@ if (dns?.setDefaultResultOrder) {
 }
 
 const app = express();
-const upload = multer(); // in-memory parser (we only store metadata)
+const upload = multer(); // in-memory parser
 
-// Basic body parsers
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Basic security headers
 app.use(helmet());
 
-// --------------------------
-// Rate limit (light)
-// --------------------------
 const limiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 300, // 300 requests per IP per hour (adjust if needed)
+  windowMs: 60 * 60 * 1000,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use(limiter);
 
-// --------------------------
-// Postgres pool (Supabase)
-// --------------------------
-// Prefer a full DATABASE_URL if available; fallback to separate env vars.
+// Postgres pool config (DATABASE_URL preferred)
 const connectionString = process.env.DATABASE_URL || null;
-
 const poolConfig = connectionString
   ? {
       connectionString,
-      ssl: {
-        require: true,
-        rejectUnauthorized: false,
-      },
+      ssl: { require: true, rejectUnauthorized: false },
     }
   : {
       host: process.env.DB_HOST,
@@ -63,15 +63,11 @@ const poolConfig = connectionString
       database: process.env.DB_NAME,
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
-      ssl: {
-        require: true,
-        rejectUnauthorized: false,
-      },
+      ssl: { require: true, rejectUnauthorized: false },
     };
 
 const pool = new Pool(poolConfig);
 
-// Helper: quick check connected (not required, but useful in logs)
 pool
   .connect()
   .then((c) => {
@@ -82,37 +78,28 @@ pool
     console.error("❌ Postgres pool initial connect failed:", err && err.message ? err.message : err);
   });
 
-// Utility: generate 16-character token (hex of 8 bytes = 16 chars)
 function genToken16() {
   return crypto.randomBytes(8).toString("hex");
 }
 
-// --------------------------
-// DB helper functions
-// --------------------------
+// DB helpers
 async function ensureInbox(address) {
   if (!address) throw new Error("no address provided to ensureInbox");
-
   const addr = String(address).trim().toLowerCase();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
     const res = await client.query(
       `select id, address, token, password_hash, created_at, last_active, deleted
-       from public.inboxes
-       where address = $1
-       limit 1`,
+       from public.inboxes where address = $1 limit 1`,
       [addr]
     );
-
     if (res.rows.length > 0) {
       const row = res.rows[0];
       await client.query(`update public.inboxes set last_active = now() where id = $1`, [row.id]);
       await client.query("COMMIT");
       return row;
     }
-
     const token = genToken16();
     const insert = await client.query(
       `insert into public.inboxes (address, token, created_at, last_active)
@@ -120,7 +107,6 @@ async function ensureInbox(address) {
        returning id, address, token, password_hash, created_at, last_active, deleted`,
       [addr, token]
     );
-
     await client.query("COMMIT");
     return insert.rows[0];
   } catch (err) {
@@ -133,10 +119,9 @@ async function ensureInbox(address) {
 
 async function getInboxById(id) {
   if (!id) return null;
-  const res = await pool.query(
-    `select id, address, token, password_hash from public.inboxes where id = $1 limit 1`,
-    [id]
-  );
+  const res = await pool.query(`select id, address, token, password_hash from public.inboxes where id = $1 limit 1`, [
+    id,
+  ]);
   return res.rows[0] || null;
 }
 
@@ -161,11 +146,8 @@ async function saveMessage(inboxId, mailFrom, mailTo, subject, body, raw, hasAtt
   return res.rows[0];
 }
 
-// --------------------------
-// Helpers: token validation
-// --------------------------
+// Helpers: token extraction + validation
 function extractTokenFromReq(req) {
-  // header takes precedence
   const header = req.headers["x-inbox-token"];
   if (header) return header;
   if (req.query && req.query.token) return String(req.query.token);
@@ -176,38 +158,25 @@ async function checkTokenForInbox(inboxId, token) {
   if (!inboxId) return false;
   const inbox = await getInboxById(inboxId);
   if (!inbox) return false;
-  // If password is set, token is not allowed
-  if (inbox.password_hash) return false;
-  // token must match exactly
+  if (inbox.password_hash) return false; // password set -> token invalid
   return !!(token && inbox.token === token);
 }
 
-// --------------------------
-// Webhook endpoint - accepts form-data/multipart
-// --------------------------
+// Webhook
 app.post("/webhook", upload.any(), async (req, res) => {
   try {
     console.log("📩 Incoming Email from CloudMailin");
-
     const fields = req.body || {};
     const files = req.files || [];
-
-    const first = (v) => {
-      if (Array.isArray(v)) return v[0];
-      return v;
-    };
-
+    const first = (v) => (Array.isArray(v) ? v[0] : v);
     const mailFrom = first(fields.from) || first(fields["envelope-from"]) || null;
-
     let mailTo = first(fields.to) || first(fields["envelope-to"]) || null;
     if (Array.isArray(mailTo)) mailTo = mailTo[0];
     if (typeof mailTo === "string" && mailTo.includes(",")) mailTo = mailTo.split(",")[0].trim();
-
     const subject = first(fields.subject) || null;
     const text = first(fields.text) || null;
     const html = first(fields.html) || null;
     const body = text || html || null;
-
     const raw = {
       fields,
       files: files.map((f) => ({
@@ -218,9 +187,7 @@ app.post("/webhook", upload.any(), async (req, res) => {
       })),
       receivedAt: new Date().toISOString(),
     };
-
     console.log("from:", mailFrom, "to:", mailTo, "subject:", subject, "attachments:", files.length);
-
     if (!mailTo) {
       console.warn("No recipient (to) found in incoming payload. Saving raw only.");
       await pool.query(
@@ -230,37 +197,25 @@ app.post("/webhook", upload.any(), async (req, res) => {
       );
       return res.status(200).send("Received - no recipient");
     }
-
     const inbox = await ensureInbox(mailTo);
     const saved = await saveMessage(inbox.id, mailFrom, mailTo, subject, body, raw, files.length > 0);
-
     console.log(`Saved message ${saved.id} for inbox ${inbox.address}`);
     return res.status(200).send("Received");
   } catch (err) {
     console.error("Error handling webhook:", err && err.stack ? err.stack : err);
-    // keep replying 200 to avoid retries from CloudMailin
     return res.status(200).send("Received (error)");
   }
 });
 
-// --------------------------
-// Read endpoints (token-protected by default)
-// --------------------------
-
-// Get inbox metadata
+// Read endpoints
 app.get("/inboxes/:address", async (req, res) => {
   try {
     const address = String(req.params.address || "").toLowerCase();
     const inbox = await getInboxByAddress(address);
     if (!inbox) return res.status(404).json({ error: "not found" });
-
-    // Do not reveal token here by default. If client provided token, verify and include it.
     const tokenProvided = extractTokenFromReq(req);
     const includeToken = tokenProvided && inbox.token === tokenProvided && !inbox.password_hash;
-    const out = {
-      id: inbox.id,
-      address: inbox.address,
-    };
+    const out = { id: inbox.id, address: inbox.address };
     if (includeToken) out.token = inbox.token;
     return res.json(out);
   } catch (err) {
@@ -269,22 +224,17 @@ app.get("/inboxes/:address", async (req, res) => {
   }
 });
 
-// List messages for inbox
-// Default security: require token unless ?require_token=0 is supplied (dev)
 app.get("/inboxes/:address/messages", async (req, res) => {
   try {
     const address = String(req.params.address || "").toLowerCase();
     const inbox = await getInboxByAddress(address);
     if (!inbox) return res.status(404).json({ error: "not found" });
-
-    const requireToken = req.query.require_token === "0" ? false : true; // default true
+    const requireToken = req.query.require_token === "0" ? false : true;
     if (requireToken) {
       const token = extractTokenFromReq(req);
       const ok = await checkTokenForInbox(inbox.id, token);
       if (!ok) return res.status(403).json({ error: "forbidden: invalid or missing token" });
     }
-
-    // fetch messages
     const limit = Math.min(100, parseInt(req.query.limit, 10) || 20);
     const msgs = await pool.query(
       `select id, inbox_id, mail_from, mail_to, subject, coalesce(body,'') as body, has_attachments, created_at
@@ -294,7 +244,6 @@ app.get("/inboxes/:address/messages", async (req, res) => {
        limit $2`,
       [inbox.id, limit]
     );
-
     return res.json({ messages: msgs.rows });
   } catch (err) {
     console.error("GET /inboxes/:address/messages error:", err && err.stack ? err.stack : err);
@@ -302,32 +251,22 @@ app.get("/inboxes/:address/messages", async (req, res) => {
   }
 });
 
-// Get a single message by id
-// Default: token is required when message.inbox_id is not null
 app.get("/messages/:id", async (req, res) => {
   try {
     const id = req.params.id;
     if (!id) return res.status(400).json({ error: "bad request" });
-
     const msgRes = await pool.query(
       `select id, inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at
        from public.messages where id = $1 limit 1`,
       [id]
     );
-
     if (!msgRes.rows.length) return res.status(404).json({ error: "not found" });
     const msg = msgRes.rows[0];
-
     if (msg.inbox_id) {
       const token = extractTokenFromReq(req);
       const ok = await checkTokenForInbox(msg.inbox_id, token);
       if (!ok) return res.status(403).json({ error: "forbidden: invalid or missing token" });
-    } else {
-      // message has no inbox (raw-only). block if require_token in query (default: allow)
-      // nothing extra for now
     }
-
-    // By default return compact view; include raw only if include_raw=1
     const includeRaw = req.query.include_raw === "1";
     const out = {
       id: msg.id,
@@ -347,34 +286,21 @@ app.get("/messages/:id", async (req, res) => {
   }
 });
 
-// --------------------------
-// Auth / Password routes
-// --------------------------
-
-// Authenticate to an inbox with token OR password
-// POST /inboxes/:address/auth
-// body: { token?: string, password?: string }
+// Auth routes
 app.post("/inboxes/:address/auth", async (req, res) => {
   try {
     const address = String(req.params.address || "").trim().toLowerCase();
     const { token, password } = req.body || {};
-
     if (!address) return res.status(400).json({ error: "missing address" });
-
     const q = `select id, token, password_hash from public.inboxes where address = $1 limit 1`;
     const r = await pool.query(q, [address]);
     if (r.rows.length === 0) return res.status(404).json({ error: "inbox not found" });
-
     const inbox = r.rows[0];
-
-    // If password set, only password is valid
     if (inbox.password_hash) {
       if (!password) return res.status(401).json({ error: "password required" });
       const ok = await bcrypt.compare(String(password), inbox.password_hash);
       return ok ? res.json({ ok: true }) : res.status(401).json({ error: "invalid password" });
     }
-
-    // If no password, token may be used
     if (!token) return res.status(401).json({ error: "token required" });
     if (String(token) === inbox.token) return res.json({ ok: true });
     return res.status(401).json({ error: "invalid token" });
@@ -384,33 +310,21 @@ app.post("/inboxes/:address/auth", async (req, res) => {
   }
 });
 
-// Set password for inbox. Requires current token (to prove owner).
-// POST /inboxes/:address/set-password
-// body: { token: string, password: string }
 app.post("/inboxes/:address/set-password", async (req, res) => {
   try {
     const address = String(req.params.address || "").trim().toLowerCase();
     const { token, password } = req.body || {};
-
     if (!address || !token || !password) return res.status(400).json({ error: "address, token and password required" });
-
     const q = `select id, token from public.inboxes where address = $1 limit 1`;
     const r = await pool.query(q, [address]);
     if (r.rows.length === 0) return res.status(404).json({ error: "inbox not found" });
-
     const inbox = r.rows[0];
     if (inbox.token !== String(token)) return res.status(401).json({ error: "invalid token" });
-
     const hash = await bcrypt.hash(String(password), SALT_ROUNDS);
     await pool.query(
-      `update public.inboxes
-         set password_hash = $1,
-             token = null,
-             last_active = now()
-       where id = $2`,
+      `update public.inboxes set password_hash = $1, token = null, last_active = now() where id = $2`,
       [hash, inbox.id]
     );
-
     return res.json({ ok: true });
   } catch (err) {
     console.error("Set-password error:", err);
@@ -418,37 +332,23 @@ app.post("/inboxes/:address/set-password", async (req, res) => {
   }
 });
 
-// Remove password (re-enable token). Requires current password.
-// POST /inboxes/:address/remove-password
-// body: { password: string }
 app.post("/inboxes/:address/remove-password", async (req, res) => {
   try {
     const address = String(req.params.address || "").trim().toLowerCase();
     const { password } = req.body || {};
-
     if (!address || !password) return res.status(400).json({ error: "address and password required" });
-
     const q = `select id, password_hash from public.inboxes where address = $1 limit 1`;
     const r = await pool.query(q, [address]);
     if (r.rows.length === 0) return res.status(404).json({ error: "inbox not found" });
-
     const inbox = r.rows[0];
     if (!inbox.password_hash) return res.status(400).json({ error: "no password set" });
-
     const ok = await bcrypt.compare(String(password), inbox.password_hash);
     if (!ok) return res.status(401).json({ error: "invalid password" });
-
-    // generate new token, clear password_hash
     const newToken = genToken16();
     await pool.query(
-      `update public.inboxes
-         set password_hash = null,
-             token = $1,
-             last_active = now()
-       where id = $2`,
+      `update public.inboxes set password_hash = null, token = $1, last_active = now() where id = $2`,
       [newToken, inbox.id]
     );
-
     return res.json({ ok: true, token: newToken });
   } catch (err) {
     console.error("Remove-password error:", err);
@@ -456,12 +356,53 @@ app.post("/inboxes/:address/remove-password", async (req, res) => {
   }
 });
 
-// Health endpoint
+// New: rotate-token (owner proves current token, receives new token)
+app.post("/inboxes/:address/rotate-token", async (req, res) => {
+  try {
+    const address = String(req.params.address || "").trim().toLowerCase();
+    const { token } = req.body || {};
+    if (!address || !token) return res.status(400).json({ error: "address and token required" });
+    const q = `select id, token, password_hash from public.inboxes where address = $1 limit 1`;
+    const r = await pool.query(q, [address]);
+    if (r.rows.length === 0) return res.status(404).json({ error: "inbox not found" });
+    const inbox = r.rows[0];
+    if (inbox.password_hash) return res.status(403).json({ error: "password set; rotate not allowed" });
+    if (String(token) !== inbox.token) return res.status(401).json({ error: "invalid token" });
+    const newToken = genToken16();
+    await pool.query(`update public.inboxes set token = $1, last_active = now() where id = $2`, [newToken, inbox.id]);
+    return res.json({ ok: true, token: newToken });
+  } catch (err) {
+    console.error("Rotate-token error:", err);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
+// New: invalidate-token (owner proves current token, then token is nulled -> no token access)
+// Note: if no password exists after invalidation, inbox becomes inaccessible until set-password or remove-password flows create a token.
+app.post("/inboxes/:address/invalidate-token", async (req, res) => {
+  try {
+    const address = String(req.params.address || "").trim().toLowerCase();
+    const { token } = req.body || {};
+    if (!address || !token) return res.status(400).json({ error: "address and token required" });
+    const q = `select id, token, password_hash from public.inboxes where address = $1 limit 1`;
+    const r = await pool.query(q, [address]);
+    if (r.rows.length === 0) return res.status(404).json({ error: "inbox not found" });
+    const inbox = r.rows[0];
+    if (inbox.password_hash) return res.status(403).json({ error: "password set; invalidate not allowed" });
+    if (String(token) !== inbox.token) return res.status(401).json({ error: "invalid token" });
+    await pool.query(`update public.inboxes set token = null, last_active = now() where id = $1`, [inbox.id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Invalidate-token error:", err);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
+// Health
 app.get("/", (req, res) => {
   res.send("TopFreeMail backend is running");
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
