@@ -188,6 +188,100 @@ app.post("/webhook", upload.any(), async (req, res) => {
   }
 });
 
+// -------------------------
+// Read endpoints for UI/testing
+// -------------------------
+
+// Helper: find inbox by address (lowercase)
+async function getInboxByAddress(address) {
+  const addr = String(address || "").trim().toLowerCase();
+  const q = `
+    SELECT id, address, token, created_at, last_active, deleted
+    FROM public.inboxes
+    WHERE address = $1
+    LIMIT 1
+  `;
+  const r = await pool.query(q, [addr]);
+  return r.rows[0] || null;
+}
+
+// GET /inboxes/:address  -> inbox metadata
+app.get("/inboxes/:address", async (req, res) => {
+  try {
+    const inbox = await getInboxByAddress(req.params.address);
+    if (!inbox) return res.status(404).json({ error: "inbox not found" });
+
+    // by default DON'T reveal token to the public. reveal only if `?reveal_token=1` AND token provided
+    if (req.query.reveal_token === "1") {
+      // require the token via query param OR header to allow admin access
+      const provided = req.query.token || req.get("x-inbox-token");
+      if (!provided || provided !== inbox.token) {
+        // hide token if not authorized
+        delete inbox.token;
+        return res.status(401).json({ error: "invalid token" });
+      }
+      // authorized: return inbox (including token)
+      return res.json(inbox);
+    }
+
+    // default safe view
+    delete inbox.token;
+    res.json(inbox);
+  } catch (err) {
+    console.error("GET /inboxes/:address error:", err && err.stack ? err.stack : err);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// GET /inboxes/:address/messages?limit=50&token=...
+// returns recent messages for an inbox. If token present, require it. If no token param, allow read
+// To enforce token by default, call with ?require_token=1
+app.get("/inboxes/:address/messages", async (req, res) => {
+  try {
+    const inbox = await getInboxByAddress(req.params.address);
+    if (!inbox) return res.status(404).json({ error: "inbox not found" });
+
+    // If token param provided or require_token=1, require it matches
+    const providedToken = req.query.token || req.get("x-inbox-token");
+    if (req.query.require_token === "1") {
+      if (!providedToken || providedToken !== inbox.token) {
+        return res.status(401).json({ error: "invalid token" });
+      }
+    }
+
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+
+    const q = `
+      SELECT id, mail_from, mail_to, subject, body, has_attachments, created_at
+      FROM public.messages
+      WHERE inbox_id = $1
+      ORDER BY created_at DESC
+      LIMIT $2
+    `;
+    const { rows } = await pool.query(q, [inbox.id, limit]);
+    res.json({ inbox: { id: inbox.id, address: inbox.address }, messages: rows });
+  } catch (err) {
+    console.error("GET /inboxes/:address/messages error:", err && err.stack ? err.stack : err);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// GET /messages/:id  -> returns full message row including raw (for viewing)
+app.get("/messages/:id", async (req, res) => {
+  try {
+    const q = `SELECT id, inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at
+               FROM public.messages
+               WHERE id = $1
+               LIMIT 1`;
+    const { rows } = await pool.query(q, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "message not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("GET /messages/:id error:", err && err.stack ? err.stack : err);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
 // Health endpoint
 app.get("/", (req, res) => {
   res.send("TopFreeMail backend is running");
