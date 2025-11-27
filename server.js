@@ -5,6 +5,7 @@
  * and auto-creates inbox records when needed.
  *
  * This version forces TLS for the pg Pool in a way that works with Supabase poolers.
+ * Adds token-protected read endpoints, rate limit and basic security headers.
  */
 
 const express = require("express");
@@ -12,6 +13,8 @@ const multer = require("multer");
 const { Pool } = require("pg");
 const crypto = require("crypto");
 const dns = require("dns");
+const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
 
 // Prefer IPv4 to avoid IPv6 routing issues
 if (dns?.setDefaultResultOrder) {
@@ -25,6 +28,20 @@ const upload = multer(); // in-memory parser (we only store metadata)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Basic security headers
+app.use(helmet());
+
+// --------------------------
+// Rate limit (light)
+// --------------------------
+const limiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 300, // 300 requests per IP per hour (adjust if needed)
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
+
 // --------------------------
 // Postgres pool (Supabase)
 // --------------------------
@@ -34,14 +51,10 @@ const connectionString = process.env.DATABASE_URL || null;
 const poolConfig = connectionString
   ? {
       connectionString,
-      // When using a connection string with sslmode=require it still helps
-      // to tell pg to accept the certificate chain used by Supabase pooler:
       ssl: {
         require: true,
         rejectUnauthorized: false,
       },
-      // optional: set a small query timeout
-      // statement_timeout: 15000,
     }
   : {
       host: process.env.DB_HOST,
@@ -73,7 +86,9 @@ function genToken16() {
   return crypto.randomBytes(8).toString("hex");
 }
 
-// Ensure inbox exists for a full email address. Returns inbox row.
+// --------------------------
+// DB helper functions
+// --------------------------
 async function ensureInbox(address) {
   if (!address) throw new Error("no address provided to ensureInbox");
 
@@ -115,7 +130,18 @@ async function ensureInbox(address) {
   }
 }
 
-// Save message to DB
+async function getInboxById(id) {
+  if (!id) return null;
+  const res = await pool.query(`select id, address, token from public.inboxes where id = $1 limit 1`, [id]);
+  return res.rows[0] || null;
+}
+
+async function getInboxByAddress(address) {
+  if (!address) return null;
+  const res = await pool.query(`select id, address, token from public.inboxes where address = $1 limit 1`, [String(address).toLowerCase()]);
+  return res.rows[0] || null;
+}
+
 async function saveMessage(inboxId, mailFrom, mailTo, subject, body, raw, hasAttachments) {
   const q = `
     insert into public.messages
@@ -128,7 +154,28 @@ async function saveMessage(inboxId, mailFrom, mailTo, subject, body, raw, hasAtt
   return res.rows[0];
 }
 
+// --------------------------
+// Helpers: token validation
+// --------------------------
+function extractTokenFromReq(req) {
+  // header takes precedence
+  const header = req.headers["x-inbox-token"];
+  if (header) return header;
+  if (req.query && req.query.token) return String(req.query.token);
+  return null;
+}
+
+async function checkTokenForInbox(inboxId, token) {
+  if (!inboxId) return false;
+  const inbox = await getInboxById(inboxId);
+  if (!inbox) return false;
+  // token must match exactly
+  return !!(token && inbox.token === token);
+}
+
+// --------------------------
 // Webhook endpoint - accepts form-data/multipart
+// --------------------------
 app.post("/webhook", upload.any(), async (req, res) => {
   try {
     console.log("📩 Incoming Email from CloudMailin");
@@ -181,104 +228,113 @@ app.post("/webhook", upload.any(), async (req, res) => {
     console.log(`Saved message ${saved.id} for inbox ${inbox.address}`);
     return res.status(200).send("Received");
   } catch (err) {
-    // Detailed logging so we can see the real DB/TLS error
     console.error("Error handling webhook:", err && err.stack ? err.stack : err);
-    // Keep replying 200 to avoid retries, but log full error in Railway
+    // keep replying 200 to avoid retries from CloudMailin
     return res.status(200).send("Received (error)");
   }
 });
 
-// -------------------------
-// Read endpoints for UI/testing
-// -------------------------
+// --------------------------
+// Read endpoints (token-protected by default)
+// --------------------------
 
-// Helper: find inbox by address (lowercase)
-async function getInboxByAddress(address) {
-  const addr = String(address || "").trim().toLowerCase();
-  const q = `
-    SELECT id, address, token, created_at, last_active, deleted
-    FROM public.inboxes
-    WHERE address = $1
-    LIMIT 1
-  `;
-  const r = await pool.query(q, [addr]);
-  return r.rows[0] || null;
-}
-
-// GET /inboxes/:address  -> inbox metadata
+// Get inbox metadata
 app.get("/inboxes/:address", async (req, res) => {
   try {
-    const inbox = await getInboxByAddress(req.params.address);
-    if (!inbox) return res.status(404).json({ error: "inbox not found" });
+    const address = String(req.params.address || "").toLowerCase();
+    const inbox = await getInboxByAddress(address);
+    if (!inbox) return res.status(404).json({ error: "not found" });
 
-    // by default DON'T reveal token to the public. reveal only if `?reveal_token=1` AND token provided
-    if (req.query.reveal_token === "1") {
-      // require the token via query param OR header to allow admin access
-      const provided = req.query.token || req.get("x-inbox-token");
-      if (!provided || provided !== inbox.token) {
-        // hide token if not authorized
-        delete inbox.token;
-        return res.status(401).json({ error: "invalid token" });
-      }
-      // authorized: return inbox (including token)
-      return res.json(inbox);
-    }
-
-    // default safe view
-    delete inbox.token;
-    res.json(inbox);
+    // Do not reveal token here by default. If client provided token, verify and include it.
+    const tokenProvided = extractTokenFromReq(req);
+    const includeToken = tokenProvided && inbox.token === tokenProvided;
+    const out = {
+      id: inbox.id,
+      address: inbox.address,
+    };
+    if (includeToken) out.token = inbox.token;
+    return res.json(out);
   } catch (err) {
     console.error("GET /inboxes/:address error:", err && err.stack ? err.stack : err);
-    res.status(500).json({ error: "server error" });
+    return res.status(500).json({ error: "server error" });
   }
 });
 
-// GET /inboxes/:address/messages?limit=50&token=...
-// returns recent messages for an inbox. If token present, require it. If no token param, allow read
-// To enforce token by default, call with ?require_token=1
+// List messages for inbox
+// Default security: require token unless ?require_token=0 is supplied (dev)
 app.get("/inboxes/:address/messages", async (req, res) => {
   try {
-    const inbox = await getInboxByAddress(req.params.address);
-    if (!inbox) return res.status(404).json({ error: "inbox not found" });
+    const address = String(req.params.address || "").toLowerCase();
+    const inbox = await getInboxByAddress(address);
+    if (!inbox) return res.status(404).json({ error: "not found" });
 
-    // If token param provided or require_token=1, require it matches
-    const providedToken = req.query.token || req.get("x-inbox-token");
-    if (req.query.require_token === "1") {
-      if (!providedToken || providedToken !== inbox.token) {
-        return res.status(401).json({ error: "invalid token" });
-      }
+    const requireToken = req.query.require_token === "0" ? false : true; // default true
+    if (requireToken) {
+      const token = extractTokenFromReq(req);
+      const ok = await checkTokenForInbox(inbox.id, token);
+      if (!ok) return res.status(403).json({ error: "forbidden: invalid or missing token" });
     }
 
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    // fetch messages
+    const limit = Math.min(100, parseInt(req.query.limit, 10) || 20);
+    const msgs = await pool.query(
+      `select id, inbox_id, mail_from, mail_to, subject, coalesce(body,'') as body, has_attachments, created_at
+       from public.messages
+       where inbox_id = $1
+       order by created_at desc
+       limit $2`,
+      [inbox.id, limit]
+    );
 
-    const q = `
-      SELECT id, mail_from, mail_to, subject, body, has_attachments, created_at
-      FROM public.messages
-      WHERE inbox_id = $1
-      ORDER BY created_at DESC
-      LIMIT $2
-    `;
-    const { rows } = await pool.query(q, [inbox.id, limit]);
-    res.json({ inbox: { id: inbox.id, address: inbox.address }, messages: rows });
+    return res.json({ messages: msgs.rows });
   } catch (err) {
     console.error("GET /inboxes/:address/messages error:", err && err.stack ? err.stack : err);
-    res.status(500).json({ error: "server error" });
+    return res.status(500).json({ error: "server error" });
   }
 });
 
-// GET /messages/:id  -> returns full message row including raw (for viewing)
+// Get a single message by id
+// Default: token is required when message.inbox_id is not null
 app.get("/messages/:id", async (req, res) => {
   try {
-    const q = `SELECT id, inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at
-               FROM public.messages
-               WHERE id = $1
-               LIMIT 1`;
-    const { rows } = await pool.query(q, [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: "message not found" });
-    res.json(rows[0]);
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ error: "bad request" });
+
+    const msgRes = await pool.query(
+      `select id, inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at
+       from public.messages where id = $1 limit 1`,
+      [id]
+    );
+
+    if (!msgRes.rows.length) return res.status(404).json({ error: "not found" });
+    const msg = msgRes.rows[0];
+
+    if (msg.inbox_id) {
+      const token = extractTokenFromReq(req);
+      const ok = await checkTokenForInbox(msg.inbox_id, token);
+      if (!ok) return res.status(403).json({ error: "forbidden: invalid or missing token" });
+    } else {
+      // message has no inbox (raw-only). block if require_token in query (default: allow)
+      // nothing extra for now
+    }
+
+    // By default return compact view; include raw only if include_raw=1
+    const includeRaw = req.query.include_raw === "1";
+    const out = {
+      id: msg.id,
+      inbox_id: msg.inbox_id,
+      mail_from: msg.mail_from,
+      mail_to: msg.mail_to,
+      subject: msg.subject,
+      body: msg.body,
+      has_attachments: msg.has_attachments,
+      created_at: msg.created_at,
+    };
+    if (includeRaw) out.raw = msg.raw;
+    return res.json(out);
   } catch (err) {
     console.error("GET /messages/:id error:", err && err.stack ? err.stack : err);
-    res.status(500).json({ error: "server error" });
+    return res.status(500).json({ error: "server error" });
   }
 });
 
