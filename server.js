@@ -1,8 +1,10 @@
 /**
- * topfreemail-backend - server.js
+ * TopFreeMail backend - server.js
  *
  * Receives CloudMailin POSTs at /webhook, saves them to Postgres (Supabase),
  * and auto-creates inbox records when needed.
+ *
+ * This version forces TLS for the pg Pool in a way that works with Supabase poolers.
  */
 
 const express = require("express");
@@ -11,9 +13,7 @@ const { Pool } = require("pg");
 const crypto = require("crypto");
 const dns = require("dns");
 
-// ---------------------------
-// FIX 1: Force IPv4 DNS first
-// ---------------------------
+// Prefer IPv4 to avoid IPv6 routing issues
 if (dns?.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
@@ -25,49 +25,60 @@ const upload = multer(); // in-memory parser (we only store metadata)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// -------------------------------------------------------------
-// FIX 2: DATABASE_URL preferred + SSL handling + IPv4 reliability
-// -------------------------------------------------------------
-const connectionString =
-  process.env.DATABASE_URL ||
-  (() => {
-    const host = process.env.DB_HOST || "localhost";
-    const port = process.env.DB_PORT
-      ? parseInt(process.env.DB_PORT, 10)
-      : 5432;
-    const database = process.env.DB_NAME || "postgres";
-    const user = process.env.DB_USER || "postgres";
-    const password = process.env.DB_PASSWORD || "";
+// --------------------------
+// Postgres pool (Supabase)
+// --------------------------
+// Prefer a full DATABASE_URL if available; fallback to separate env vars.
+const connectionString = process.env.DATABASE_URL || null;
 
-    return `postgres://${encodeURIComponent(
-      user
-    )}:${encodeURIComponent(password)}@${host}:${port}/${database}?sslmode=require`;
-  })();
+const poolConfig = connectionString
+  ? {
+      connectionString,
+      // When using a connection string with sslmode=require it still helps
+      // to tell pg to accept the certificate chain used by Supabase pooler:
+      ssl: {
+        require: true,
+        rejectUnauthorized: false,
+      },
+      // optional: set a small query timeout
+      // statement_timeout: 15000,
+    }
+  : {
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 5432,
+      database: process.env.DB_NAME,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      ssl: {
+        require: true,
+        rejectUnauthorized: false,
+      },
+    };
 
-// Postgres pool (Supabase requires SSL)
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 5432,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  ssl: {
-    rejectUnauthorized: false    // Supabase uses a self-signed cert for pooled connections
-  }
-});
+const pool = new Pool(poolConfig);
 
-// Generate 16-char token
+// Helper: quick check connected (not required, but useful in logs)
+pool
+  .connect()
+  .then((c) => {
+    c.release();
+    console.log("✅ Postgres pool connected (initial check)");
+  })
+  .catch((err) => {
+    console.error("❌ Postgres pool initial connect failed:", err && err.message ? err.message : err);
+  });
+
+// Utility: generate 16-character token (hex of 8 bytes = 16 chars)
 function genToken16() {
   return crypto.randomBytes(8).toString("hex");
 }
 
-// Ensure inbox exists
+// Ensure inbox exists for a full email address. Returns inbox row.
 async function ensureInbox(address) {
   if (!address) throw new Error("no address provided to ensureInbox");
 
   const addr = String(address).trim().toLowerCase();
   const client = await pool.connect();
-
   try {
     await client.query("BEGIN");
 
@@ -81,10 +92,7 @@ async function ensureInbox(address) {
 
     if (res.rows.length > 0) {
       const row = res.rows[0];
-      await client.query(
-        `update public.inboxes set last_active = now() where id = $1`,
-        [row.id]
-      );
+      await client.query(`update public.inboxes set last_active = now() where id = $1`, [row.id]);
       await client.query("COMMIT");
       return row;
     }
@@ -107,37 +115,20 @@ async function ensureInbox(address) {
   }
 }
 
-// Save message
-async function saveMessage(
-  inboxId,
-  mailFrom,
-  mailTo,
-  subject,
-  body,
-  raw,
-  hasAttachments
-) {
+// Save message to DB
+async function saveMessage(inboxId, mailFrom, mailTo, subject, body, raw, hasAttachments) {
   const q = `
     insert into public.messages
       (inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at)
     values ($1, $2, $3, $4, $5, $6, $7, now())
     returning id
   `;
-  const vals = [
-    inboxId,
-    mailFrom || null,
-    mailTo || null,
-    subject || null,
-    body || null,
-    raw || null,
-    !!hasAttachments,
-  ];
-
+  const vals = [inboxId, mailFrom || null, mailTo || null, subject || null, body || null, raw || null, !!hasAttachments];
   const res = await pool.query(q, vals);
   return res.rows[0];
 }
 
-// Webhook
+// Webhook endpoint - accepts form-data/multipart
 app.post("/webhook", upload.any(), async (req, res) => {
   try {
     console.log("📩 Incoming Email from CloudMailin");
@@ -145,18 +136,16 @@ app.post("/webhook", upload.any(), async (req, res) => {
     const fields = req.body || {};
     const files = req.files || [];
 
-    const first = (v) => (Array.isArray(v) ? v[0] : v);
+    const first = (v) => {
+      if (Array.isArray(v)) return v[0];
+      return v;
+    };
 
-    const mailFrom =
-      first(fields.from) || first(fields["envelope-from"]) || null;
+    const mailFrom = first(fields.from) || first(fields["envelope-from"]) || null;
 
-    let mailTo =
-      first(fields.to) || first(fields["envelope-to"]) || null;
-
+    let mailTo = first(fields.to) || first(fields["envelope-to"]) || null;
     if (Array.isArray(mailTo)) mailTo = mailTo[0];
-    if (typeof mailTo === "string" && mailTo.includes(",")) {
-      mailTo = mailTo.split(",")[0].trim();
-    }
+    if (typeof mailTo === "string" && mailTo.includes(",")) mailTo = mailTo.split(",")[0].trim();
 
     const subject = first(fields.subject) || null;
     const text = first(fields.text) || null;
@@ -174,22 +163,12 @@ app.post("/webhook", upload.any(), async (req, res) => {
       receivedAt: new Date().toISOString(),
     };
 
-    console.log(
-      "from:",
-      mailFrom,
-      "to:",
-      mailTo,
-      "subject:",
-      subject,
-      "attachments:",
-      files.length
-    );
+    console.log("from:", mailFrom, "to:", mailTo, "subject:", subject, "attachments:", files.length);
 
     if (!mailTo) {
-      console.warn("No recipient found in payload.");
+      console.warn("No recipient (to) found in incoming payload. Saving raw only.");
       await pool.query(
-        `insert into public.messages
-         (inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at)
+        `insert into public.messages (inbox_id, mail_from, mail_to, subject, body, raw, has_attachments, created_at)
          values (null, $1, null, $2, $3, $4, $5, now())`,
         [mailFrom, subject, body, raw, files.length > 0]
       );
@@ -197,25 +176,19 @@ app.post("/webhook", upload.any(), async (req, res) => {
     }
 
     const inbox = await ensureInbox(mailTo);
-    const saved = await saveMessage(
-      inbox.id,
-      mailFrom,
-      mailTo,
-      subject,
-      body,
-      raw,
-      files.length > 0
-    );
+    const saved = await saveMessage(inbox.id, mailFrom, mailTo, subject, body, raw, files.length > 0);
 
     console.log(`Saved message ${saved.id} for inbox ${inbox.address}`);
     return res.status(200).send("Received");
   } catch (err) {
-    console.error("Error handling webhook:", err);
+    // Detailed logging so we can see the real DB/TLS error
+    console.error("Error handling webhook:", err && err.stack ? err.stack : err);
+    // Keep replying 200 to avoid retries, but log full error in Railway
     return res.status(200).send("Received (error)");
   }
 });
 
-// Health
+// Health endpoint
 app.get("/", (req, res) => {
   res.send("TopFreeMail backend is running");
 });
