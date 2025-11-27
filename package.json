@@ -12,6 +12,7 @@
   "multer": "^2.0.0",
   "express-rate-limit": "^7.0.0",
   "helmet": "^7.0.0"
+  "bcrypt": "^5.1.0"
 }
 }
 
