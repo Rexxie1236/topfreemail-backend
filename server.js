@@ -44,9 +44,16 @@ const connectionString =
     )}:${encodeURIComponent(password)}@${host}:${port}/${database}?sslmode=require`;
   })();
 
+// Postgres pool (Supabase requires SSL)
 const pool = new Pool({
-  connectionString,
-  ssl: { rejectUnauthorized: false }, // required for Supabase pooler
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 5432,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  ssl: {
+    rejectUnauthorized: false    // Supabase uses a self-signed cert for pooled connections
+  }
 });
 
 // Generate 16-char token
