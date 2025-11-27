@@ -36,6 +36,7 @@ if (dns?.setDefaultResultOrder) {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 const upload = multer(); // in-memory parser
 
 app.use(express.json());
